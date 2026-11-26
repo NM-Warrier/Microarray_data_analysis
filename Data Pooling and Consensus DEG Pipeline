@@ -1,0 +1,263 @@
+# GENERAL DATA POOLING PIPELINE
+# Single script: pooling -> RMA -> batch correction -> PCA/QC -> DEG -> consensus.
+# Use CEL files from the SAME compatible Affymetrix platform only.
+# Cross-platform pooling requires a different harmonization workflow.
+
+library(affy)
+library(limma)
+library(ggplot2)
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+
+setwd("path/to/working_directory")
+
+# Load your own metadata: one row per sample, with these required columns:
+# SampleID | CEL_File | Group | Dataset
+# CEL_File is the path to each CEL file; Dataset identifies the study/batch.
+# Use globally unique SampleIDs and valid R names for Group labels.
+meta_all <- read.xlsx("YOUR_METADATA.xlsx")
+head(meta_all)
+
+groups_to_use <- c("Group_A", "Group_B")
+base_dir <- "YOUR_OUTPUT_DIRECTORY"
+adjusted_p_cutoff <- 0.05
+logfc_cutoff <- 1
+# Optional annotation CSV: ProbeID,GeneSymbol. NULL skips annotation.
+annotation_file <- NULL
+# Optional user-supplied RDS: named list of list(raw = AffyBatch, meta = data.frame).
+# Each meta needs SampleID, Group, Dataset; IDs must match sampleNames(raw).
+# NULL pools all selected CEL files into a single iteration.
+raw_subsets_file <- NULL
+# Optional exclusions after independent QC review: Iteration,SampleID,Reason.
+# PCA IQR flags below are for review and do not automatically remove samples.
+exclusion_file <- NULL
+
+# Output directories
+for (folder in c("PCA_Before", "PCA_Normalized", "PCA_After", "Outlier_QC",
+                 "Normalized_Data", "DEGs", "Mapping_QC")) {
+  dir.create(file.path(base_dir, folder), recursive = TRUE, showWarnings = FALSE)
+}
+
+# Pool raw data across datasets
+required <- c("SampleID", "Group", "Dataset")
+stopifnot(all(required %in% names(meta_all)))
+stopifnot(!anyNA(meta_all[required]), !anyDuplicated(meta_all$SampleID))
+stopifnot(all(vapply(meta_all[required], function(x) all(nzchar(trimws(x))), logical(1))))
+meta_use <- meta_all %>% filter(Group %in% groups_to_use)
+stopifnot(length(groups_to_use) == 2, !anyDuplicated(groups_to_use))
+stopifnot(all(make.names(groups_to_use) == groups_to_use))
+
+if (is.null(raw_subsets_file)) {
+  stopifnot("CEL_File" %in% names(meta_use), nrow(meta_use) > 0)
+  stopifnot(!anyNA(meta_use$CEL_File), !anyDuplicated(meta_use$CEL_File))
+  stopifnot(all(file.exists(meta_use$CEL_File)))
+  raw_pooled <- ReadAffy(filenames = meta_use$CEL_File)
+  sampleNames(raw_pooled) <- meta_use$SampleID
+  analysis_sets_raw <- list(iter1 = list(raw = raw_pooled, meta = meta_use))
+} else {
+  analysis_sets_raw <- readRDS(raw_subsets_file)
+}
+stopifnot(length(analysis_sets_raw) > 0, !is.null(names(analysis_sets_raw)))
+stopifnot(!anyDuplicated(names(analysis_sets_raw)))
+stopifnot(all(grepl("^[A-Za-z][A-Za-z0-9_]{0,24}$", names(analysis_sets_raw))))
+saveRDS(analysis_sets_raw, file.path(base_dir, "Pooled_RAW_Subsets.rds"))
+# Existing iterations are processed as supplied; this script does not resample.
+
+# Optional annotation
+annotation <- NULL
+if (!is.null(annotation_file)) {
+  annotation <- read.csv(annotation_file, stringsAsFactors = FALSE)
+  stopifnot(all(c("ProbeID", "GeneSymbol") %in% names(annotation)))
+  stopifnot(!anyNA(annotation$ProbeID), !anyDuplicated(annotation$ProbeID))
+}
+
+# Optional reviewed sample exclusions
+exclusions <- data.frame(Iteration = character(), SampleID = character(), Reason = character())
+if (!is.null(exclusion_file)) {
+  exclusions <- read.csv(exclusion_file, stringsAsFactors = FALSE)
+  stopifnot(all(c("Iteration", "SampleID", "Reason") %in% names(exclusions)))
+  stopifnot(!anyNA(exclusions), all(nzchar(trimws(exclusions$Reason))))
+  stopifnot(all(exclusions$Iteration %in% names(analysis_sets_raw)))
+}
+write.xlsx(exclusions, file.path(base_dir, "Reviewed_exclusions.xlsx"), overwrite = TRUE)
+
+# PCA helper
+run_pca <- function(expr, meta, iter, stage, outdir) {
+  stopifnot(identical(colnames(expr), meta$SampleID), all(is.finite(expr)))
+  variable <- apply(expr, 1, var) > 0
+  stopifnot(sum(variable) >= 2, ncol(expr) >= 3)
+  pca <- prcomp(t(expr[variable, , drop = FALSE]), scale. = TRUE)
+  variance <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+  df <- data.frame(SampleID = rownames(pca$x), PC1 = pca$x[, 1], PC2 = pca$x[, 2],
+                   Group = meta$Group, Batch = meta$Dataset, Iteration = iter, Stage = stage)
+  write.xlsx(df, file.path(outdir, paste0("PCA_", stage, "_", iter, ".xlsx")), overwrite = TRUE)
+  p <- ggplot(df, aes(PC1, PC2, color = Group)) +
+    geom_point(size = 2) + facet_wrap(~ Batch) + theme_minimal(base_size = 12) +
+    labs(title = paste(stage, iter, sep = " | "),
+         x = sprintf("PC1 (%.1f%%)", variance[1]), y = sprintf("PC2 (%.1f%%)", variance[2]))
+  ggsave(file.path(outdir, paste0("PCA_", stage, "_", iter, ".png")), p, width = 8, height = 5)
+  df
+}
+
+# Helper: flag unusual PC scores for review
+detect_outliers <- function(x) {
+  q <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  spread <- q[2] - q[1]
+  x < q[1] - 1.5 * spread | x > q[2] + 1.5 * spread
+}
+
+# Storage
+pca_before_all <- list()
+pca_after_all <- list()
+all_outliers <- list()
+deg_list <- list()
+deg_sets <- list()
+normalized_sets <- list()
+
+# Main loop: normalize and analyze each pooled iteration
+for (iter in names(analysis_sets_raw)) {
+  message("Processing ", iter)
+  raw <- analysis_sets_raw[[iter]]$raw
+  meta <- analysis_sets_raw[[iter]]$meta
+  stopifnot(inherits(raw, "AffyBatch"), all(required %in% names(meta)))
+  stopifnot(!anyDuplicated(meta$SampleID), !anyDuplicated(sampleNames(raw)))
+  stopifnot(!anyNA(meta[required]))
+  stopifnot(all(vapply(meta[required], function(x) all(nzchar(trimws(x))), logical(1))))
+
+  # Sample mapping QC: exact IDs only; never silently drop unmatched samples.
+  expr_only <- setdiff(sampleNames(raw), meta$SampleID)
+  meta_only <- setdiff(meta$SampleID, sampleNames(raw))
+  write.xlsx(list(Expression_only = data.frame(SampleID = expr_only),
+                  Metadata_only = data.frame(SampleID = meta_only)),
+             file.path(base_dir, "Mapping_QC", paste0(iter, "_Mapping.xlsx")), overwrite = TRUE)
+  if (length(expr_only) || length(meta_only)) stop("Sample mapping mismatch in ", iter)
+  meta <- meta[match(sampleNames(raw), meta$SampleID), , drop = FALSE]
+  selected <- meta$Group %in% groups_to_use
+  raw <- raw[, selected]
+  meta <- meta[selected, , drop = FALSE]
+
+  # Remove explicitly reviewed samples before normalization/model fitting.
+  remove_ids <- exclusions$SampleID[exclusions$Iteration == iter]
+  stopifnot(all(remove_ids %in% meta$SampleID))
+  keep <- !meta$SampleID %in% remove_ids
+  raw <- raw[, keep]
+  meta <- meta[keep, , drop = FALSE]
+  meta$Group <- factor(meta$Group, levels = groups_to_use)
+  meta$Dataset <- droplevels(factor(meta$Dataset))
+  stopifnot(identical(sampleNames(raw), meta$SampleID))
+  stopifnot(all(table(meta$Group) >= 2))
+
+  # PCA before normalization: raw probe intensities, not probe-set estimates.
+  raw_expr <- log2(exprs(raw) + 1)
+  pca_before_all[[iter]] <- run_pca(raw_expr, meta, iter, "BeforeNorm",
+                                   file.path(base_dir, "PCA_Before"))
+
+  # Joint RMA normalization of pooled compatible arrays
+  norm <- affy::rma(raw)
+  norm_expr <- exprs(norm)
+  stopifnot(identical(colnames(norm_expr), meta$SampleID))
+  run_pca(norm_expr, meta, iter, "AfterRMA", file.path(base_dir, "PCA_Normalized"))
+
+  # Preserve biological groups during batch correction for visualization.
+  group_design <- model.matrix(~ 0 + Group, meta)
+  colnames(group_design) <- groups_to_use
+  if (nlevels(meta$Dataset) > 1) {
+    design <- model.matrix(~ 0 + Group + Dataset, meta)
+    colnames(design)[seq_along(groups_to_use)] <- groups_to_use
+    if (qr(design)$rank < ncol(design)) {
+      stop("Group and batch effects cannot be separated in ", iter,
+           ". Review the study design and group-by-dataset table.")
+    }
+    norm_expr_bc <- removeBatchEffect(norm_expr, batch = meta$Dataset, design = group_design)
+  } else {
+    design <- group_design
+    norm_expr_bc <- norm_expr
+  }
+  stopifnot(nrow(design) > qr(design)$rank)
+  pca_after_all[[iter]] <- run_pca(norm_expr_bc, meta, iter, "AfterBatchCorrection",
+                                  file.path(base_dir, "PCA_After"))
+
+  # PCA outlier QC: save flags and boxplots; review before adding exclusions.
+  pca_long <- pca_after_all[[iter]] %>%
+    pivot_longer(c(PC1, PC2), names_to = "PC", values_to = "Score") %>%
+    group_by(PC) %>% mutate(IsOutlier = detect_outliers(Score)) %>% ungroup()
+  all_outliers[[iter]] <- pca_long
+  write.xlsx(pca_long, file.path(base_dir, "Outlier_QC", paste0(iter, "_PCA_flags.xlsx")), overwrite = TRUE)
+  p <- ggplot(pca_long, aes(PC, Score)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = IsOutlier), width = 0.15) + theme_classic() +
+    labs(title = paste("PCA review", iter))
+  ggsave(file.path(base_dir, "Outlier_QC", paste0(iter, "_Boxplot.png")), p, width = 6, height = 5)
+
+  # Save normalized expression, metadata, and design without Excel round trips.
+  # Separate files per iteration avoid workbook size limits across iterations.
+  write.csv(data.frame(ProbeID = rownames(norm_expr), norm_expr, check.names = FALSE),
+            file.path(base_dir, "Normalized_Data", paste0(iter, "_RMA.csv")), row.names = FALSE)
+  write.csv(data.frame(ProbeID = rownames(norm_expr_bc), norm_expr_bc, check.names = FALSE),
+            file.path(base_dir, "Normalized_Data", paste0(iter, "_BatchCorrected.csv")), row.names = FALSE)
+  write.xlsx(list(Metadata = meta, Design = data.frame(SampleID = meta$SampleID, design),
+                  Group_by_dataset = as.data.frame(table(meta$Group, meta$Dataset))),
+             file.path(base_dir, "Mapping_QC", paste0(iter, "_Samples_design.xlsx")), overwrite = TRUE)
+  normalized_sets[[iter]] <- list(expression = norm_expr, corrected = norm_expr_bc, meta = meta)
+
+  # Differential expression: use uncorrected RMA values and model batch directly.
+  # Adapt the model for paired samples or other study-specific covariates.
+  fit <- lmFit(norm_expr, design)
+  contrast.matrix <- makeContrasts(
+    contrasts = paste(groups_to_use[2], "-", groups_to_use[1]), levels = design)
+  fit2 <- eBayes(contrasts.fit(fit, contrast.matrix))
+  deg <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH")
+  deg$ProbeID <- rownames(deg)
+  if (!is.null(annotation)) {
+    deg$GeneSymbol <- annotation$GeneSymbol[match(deg$ProbeID, annotation$ProbeID)]
+  }
+  deg$Iteration <- iter
+  deg$Significant <- deg$adj.P.Val < adjusted_p_cutoff & abs(deg$logFC) >= logfc_cutoff
+  deg$Regulation <- ifelse(deg$logFC > 0, "Up", ifelse(deg$logFC < 0, "Down", "Unchanged"))
+  deg <- deg %>% relocate(ProbeID)
+  deg_list[[iter]] <- deg
+  # Probe IDs are retained: no selection of a gene's smallest P value.
+  deg_sets[[iter]] <- deg$ProbeID[which(deg$Significant)]
+  write.xlsx(list(All_results = deg, Significant = deg[which(deg$Significant), ]),
+             file.path(base_dir, "DEGs", paste0(iter, "_DEGs.xlsx")), overwrite = TRUE)
+}
+
+# Save combined results
+saveRDS(normalized_sets, file.path(base_dir, "Normalized_data_AllIterations.rds"))
+write.xlsx(deg_list, file.path(base_dir, "DEGs", "DEGs_AllIterations.xlsx"), overwrite = TRUE)
+write.xlsx(bind_rows(pca_before_all), file.path(base_dir, "PCA_Before_AllIterations.xlsx"), overwrite = TRUE)
+write.xlsx(bind_rows(pca_after_all), file.path(base_dir, "PCA_After_AllIterations.xlsx"), overwrite = TRUE)
+write.xlsx(bind_rows(all_outliers), file.path(base_dir, "PCA_QC_AllIterations.xlsx"), overwrite = TRUE)
+
+# Common and unique significant probe sets
+common_probes <- Reduce(intersect, deg_sets)
+unique_probes <- lapply(names(deg_sets), function(nm) {
+  setdiff(deg_sets[[nm]], unlist(deg_sets[names(deg_sets) != nm], use.names = FALSE))
+})
+names(unique_probes) <- names(deg_sets)
+write.xlsx(c(list(Common = data.frame(ProbeID = common_probes)),
+             lapply(unique_probes, function(x) data.frame(ProbeID = x))),
+           file.path(base_dir, "DEGs", "Common_Unique_DEGs.xlsx"), overwrite = TRUE)
+
+# Consensus matrix: significant in how many iterations?
+# This counts significance regardless of direction; it is descriptive, not a meta-analysis.
+# Overlapping iterations are not independent biological replication.
+all_probes <- unique(unlist(deg_sets, use.names = FALSE))
+consensus_df <- data.frame(ProbeID = all_probes)
+for (iter in names(deg_sets)) consensus_df[[iter]] <- all_probes %in% deg_sets[[iter]]
+consensus_df$n_iterations <- rowSums(consensus_df[, names(deg_sets), drop = FALSE])
+write.xlsx(list(All = consensus_df,
+                In_all_iterations = consensus_df[consensus_df$n_iterations == length(deg_sets), ],
+                In_at_least_two = consensus_df[consensus_df$n_iterations >= 2, ]),
+           file.path(base_dir, "DEGs", "DEG_Consensus.xlsx"), overwrite = TRUE)
+
+# Optional UpSet plot for two or more iterations with significant probes
+if (length(deg_sets) >= 2 && nrow(consensus_df) > 0 && requireNamespace("ComplexUpset", quietly = TRUE)) {
+  upset_input <- consensus_df %>% dplyr::select(-n_iterations)
+  p <- ComplexUpset::upset(upset_input, intersect = names(deg_sets), min_size = 1)
+  ggsave(file.path(base_dir, "DEGs", "DEG_UpSet.png"), p, width = 9, height = 6)
+}
+
+capture.output(sessionInfo(), file = file.path(base_dir, "session_info.txt"))
+message("Pooling analysis complete: ", base_dir)
