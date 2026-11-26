@@ -1,0 +1,206 @@
+# General microarray analysis pipeline
+# Replace the placeholders below with the details for your dataset.
+setwd("path/to/working_directory")
+
+# Open necessary libraries
+library(affy)
+library(GEOquery)
+library(tidyverse)
+library(limma)
+library(ggplot2)
+library(readxl)
+library(openxlsx)
+library(factoextra)
+
+# Untar files (skip if already extracted)
+untar("DATASET_RAW.tar", exdir = "data/")
+
+# Reading in CEL files
+celfiles <- list.files("data", pattern = "\\.CEL(\\.GZ)?$",
+                       full.names = TRUE, ignore.case = TRUE)
+
+# Read CEL files using affy (for compatible array platforms)
+rawData <- ReadAffy(filenames = celfiles)
+# For platforms requiring oligo, use oligo::read.celfiles() and oligo::rma().
+
+# Data cleanup: match filenames to the sample IDs used in GEO metadata.
+# Edit this step if your filenames contain additional text.
+filename <- basename(celfiles)
+pData(rawData)$filename <- filename
+sample_ids <- sub("\\.CEL(\\.GZ)?$", "", filename, ignore.case = TRUE)
+sampleNames(rawData) <- sample_ids
+
+# Apply RMA normalization
+normalized.data <- affy::rma(rawData)
+head(exprs(normalized.data))
+
+# Get expression estimates
+normalized.expr <- as.data.frame(exprs(normalized.data))
+normalized.expr <- rownames_to_column(normalized.expr, var = "ID")
+
+# Get sample metadata
+gse <- getGEO("GSEXXXX", GSEMatrix = TRUE)
+# If multiple platforms are returned, select the one matching your CEL files.
+metadata <- pData(gse[[1]])
+head(metadata)
+
+# Select the sample ID and condition columns by name.
+# Replace CONDITION_COLUMN with the relevant column in your metadata.
+metadatasubset <- metadata %>%
+  dplyr::select(geo_accession, Condition = all_of("CONDITION_COLUMN"))
+
+# Rename conditions as needed using your own metadata labels.
+# Example:
+# metadatasubset$Condition <- recode(metadatasubset$Condition,
+#                                  "original label A" = "Group_A",
+#                                  "original label B" = "Group_B")
+
+# Check that every expression sample has exactly one metadata record.
+stopifnot(!anyDuplicated(metadatasubset$geo_accession))
+stopifnot(all(colnames(normalized.expr)[-1] %in% metadatasubset$geo_accession))
+
+# Reshape data
+# Retain sample IDs as column names; keep conditions in the metadata.
+data.long <- normalized.expr %>%
+  pivot_longer(-ID, names_to = "Sample", values_to = "Expression") %>%
+  inner_join(metadatasubset, by = c("Sample" = "geo_accession"))
+
+selected_columns <- data.long %>% dplyr::select(ID, Sample, Expression)
+spread_data <- selected_columns %>%
+  pivot_wider(names_from = Sample, values_from = Expression)
+
+# Map probe IDs to gene symbols
+feature.data <- fData(gse[[1]])
+colnames(feature.data) # Inspect the annotation column names.
+# Replace GENE_SYMBOL_COLUMN with the relevant annotation column.
+feature.data <- feature.data %>%
+  dplyr::select(ID, Gene_symbol = all_of("GENE_SYMBOL_COLUMN"))
+feature.data$ID <- as.character(feature.data$ID)
+stopifnot(!anyDuplicated(feature.data$ID))
+
+data <- spread_data %>% left_join(feature.data, by = "ID")
+
+# Preserve original probe IDs and gene symbols without splitting or truncating.
+Final <- data %>% dplyr::select(ID, Gene_symbol, everything())
+
+# Write normalized expression data
+write.table(Final, file = "normalized_expression.tsv", sep = "\t", row.names = FALSE)
+write.xlsx(Final, file = "normalized_expression.xlsx", rowNames = FALSE)
+
+# PCA and DEG
+# Read data
+normdat1 <- as.data.frame(read_excel("normalized_expression.xlsx"))
+head(normdat1)
+
+data_numeric <- normdat1 %>% dplyr::select(-ID, -Gene_symbol)
+rownames(data_numeric) <- normdat1$ID
+
+# Remove constant probes for PCA only.
+variable_probes <- apply(data_numeric, 1, var) > 0
+pca_result <- prcomp(t(data_numeric[variable_probes, , drop = FALSE]), scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_scores$Sample <- rownames(pca_scores)
+
+# Explore the number of clusters; adjust k.max for your sample count.
+fviz_nbclust(pca_scores[, 1:2], kmeans, method = "silhouette",
+             k.max = min(10, nrow(pca_scores) - 1)) +
+  labs(title = "Optimal Number of Clusters (Silhouette Analysis)")
+
+# K-means clustering: choose the number of clusters for your analysis.
+number_of_clusters <- 2
+set.seed(123)
+kmeans_result <- kmeans(pca_scores[, 1:2], centers = number_of_clusters, nstart = 25)
+pca_scores$Kmeans_cluster <- factor(kmeans_result$cluster)
+
+# Hierarchical clustering
+dist_matrix <- dist(pca_scores[, 1:2])
+hc <- hclust(dist_matrix, method = "ward.D2")
+pca_scores$Cluster <- factor(cutree(hc, k = number_of_clusters))
+
+# Visualize clusters
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 4) + theme_minimal() +
+  labs(title = "Clusters in PCA Space", color = "Cluster")
+
+# View cluster composition and export sample assignments
+table(pca_scores$Cluster)
+samples_by_cluster <- pca_scores[, c("Sample", "Cluster", "Kmeans_cluster")]
+write.xlsx(samples_by_cluster, file = "Clusters.xlsx")
+
+# Optional sample removal: enter sample IDs only after independent QC review.
+# Cluster membership alone is not a reason to remove samples.
+samples_to_remove <- character(0)
+normdata1_filtered <- normdat1 %>%
+  dplyr::select(-any_of(samples_to_remove))
+
+# Reorder sample columns alphabetically, retaining annotation columns first.
+normdat1 <- normdata1_filtered %>%
+  dplyr::select(ID, Gene_symbol,
+                all_of(sort(setdiff(names(normdata1_filtered), c("ID", "Gene_symbol")))))
+
+# Define sample names and their conditions from metadata.
+sample_names <- setdiff(colnames(normdat1), c("ID", "Gene_symbol"))
+sample_info <- data.frame(
+  Sample = sample_names,
+  Condition = metadatasubset$Condition[
+    match(sample_names, metadatasubset$geo_accession)]
+)
+stopifnot(!anyNA(sample_info$Condition))
+sample_info$Condition <- factor(sample_info$Condition)
+# Use valid R condition names, such as Group_A and Group_B.
+stopifnot(all(make.names(levels(sample_info$Condition)) == levels(sample_info$Condition)))
+
+# Extract expression data, retaining probe IDs as unique identifiers.
+expression_data <- as.matrix(normdat1[, sample_names, drop = FALSE])
+rownames(expression_data) <- normdat1$ID
+stopifnot(!anyDuplicated(rownames(expression_data)))
+
+# Create design matrix (independent samples, condition-only design).
+# Adapt this design if your study includes batches, pairing, or other covariates.
+design <- model.matrix(~ 0 + Condition, data = sample_info)
+colnames(design) <- levels(sample_info$Condition)
+rownames(design) <- sample_info$Sample
+stopifnot(nrow(design) > qr(design)$rank)
+
+# Fit linear model
+fit <- lmFit(expression_data, design)
+
+# Create contrast matrix: replace Group_A and Group_B with your condition names.
+# Add further comparisons here if needed.
+contrast.matrix <- makeContrasts(
+  Group_B_vs_Group_A = Group_B - Group_A,
+  levels = design
+)
+print(contrast.matrix)
+
+# Fit contrasts
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Get results for each contrast
+topTable_Group_B_vs_Group_A <- topTable(
+  fit2, coef = "Group_B_vs_Group_A", number = Inf, adjust.method = "BH"
+)
+
+add_regulation_column <- function(table) {
+  table$ID <- rownames(table)
+  table$Gene_symbol <- normdat1$Gene_symbol[match(table$ID, normdat1$ID)]
+  table$Regulation <- ifelse(table$logFC > 0, "Up",
+                             ifelse(table$logFC < 0, "Down", "Unchanged"))
+  table %>% relocate(ID, Gene_symbol, .before = 1)
+}
+
+# Apply to results
+topTable_Group_B_vs_Group_A <- add_regulation_column(topTable_Group_B_vs_Group_A)
+
+# Save all results to Excel (Up/Down describes direction, not significance).
+write.xlsx(list(Group_B_vs_Group_A = topTable_Group_B_vs_Group_A),
+           file = "Differential_expression_results.xlsx")
+
+# Optional DEG filtering: adjust thresholds for your analysis.
+DEGs <- topTable_Group_B_vs_Group_A %>%
+  filter(adj.P.Val < 0.05, abs(logFC) >= 1)
+write.xlsx(DEGs, file = "Significant_DEGs.xlsx")
+
+# Record package versions
+capture.output(sessionInfo(), file = "session_info.txt")
