@@ -1,0 +1,512 @@
+setwd("path/to/working_directory")
+
+# ===============================================================
+# CREATE DIRECTIONAL CONSENSUS DEG LISTS
+# One workbook per comparison; one iteration per worksheet.
+# All worksheets must use the same contrast direction and log2 FC units.
+# Include iteration sheets only (no summaries or other tables).
+# ===============================================================
+
+library(readxl)
+library(openxlsx)
+library(dplyr)
+library(stringr)
+
+# ===============================================================
+# PATHS AND THRESHOLDS
+# ===============================================================
+
+model_dir <- "path/to/input_directory"
+output_dir <- file.path(model_dir, "Directional_Consensus_DEGs")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+adjusted_p_cutoff <- 0.05
+absolute_log2fc_cutoff <- 1 # Edit for your analysis.
+stopifnot(adjusted_p_cutoff > 0, adjusted_p_cutoff <= 1,
+          is.finite(absolute_log2fc_cutoff), absolute_log2fc_cutoff >= 0)
+
+# ===============================================================
+# DEG FILES: replace these placeholders; add or remove entries.
+# ===============================================================
+
+deg_files <- c(
+  "Comparison_A_DEGs_AllIterations.xlsx",
+  "Comparison_B_DEGs_AllIterations.xlsx"
+)
+
+# ===============================================================
+# HELPER FUNCTION
+# ===============================================================
+
+find_col <- function(df, possible_names) {
+  matched <- possible_names[possible_names %in% colnames(df)]
+  if (length(matched) == 0) return(NA_character_)
+  matched[1]
+}
+
+# ===============================================================
+# MAIN LOOP
+# ===============================================================
+
+for (file in deg_files) {
+  cat("Processing:", file, "\n")
+  comparison_name <- str_remove(file, "_DEGs_AllIterations\\.xlsx$")
+  comparison_name <- str_remove(comparison_name, "\\.xlsx$")
+  file_path <- file.path(model_dir, file)
+  sheets <- excel_sheets(file_path)
+  all_deg_list <- list()
+
+  # =========================================================
+  # READ EACH ITERATION SHEET
+  # =========================================================
+
+  for (sh in sheets) {
+    cat("Reading sheet:", sh, "\n")
+    df <- as.data.frame(read_excel(file_path, sheet = sh))
+
+    # Edit aliases below if your column names differ.
+    # Choose one consistent identifier type across all sheets.
+    gene_col <- find_col(df, c("GeneSymbol", "gene_symbol", "Gene", "gene", "SYMBOL", "Symbol", "gene_id", "ProbeID"))
+    logfc_col <- find_col(df, c("logFC", "LogFC", "log2FC", "log2FoldChange", "estimate"))
+    padj_col <- find_col(df, c("adj.P.Val", "padj", "p.adjust", "FDR"))
+
+    if (anyNA(c(gene_col, logfc_col, padj_col))) {
+      stop("Required columns missing in file: ", file, " sheet: ", sh)
+    }
+    # 'estimate' is supported only when it represents a log2 fold change.
+    for (column in c(logfc_col, padj_col)) {
+      original <- df[[column]]
+      converted <- suppressWarnings(as.numeric(as.character(original)))
+      if (any(!is.na(original) & is.na(converted))) {
+        stop("Nonnumeric values in ", column, " | ", file, " | ", sh)
+      }
+      df[[column]] <- converted
+    }
+    if (any(df[[padj_col]] < 0 | df[[padj_col]] > 1, na.rm = TRUE)) {
+      stop("Adjusted P values must be between 0 and 1: ", file, " | ", sh)
+    }
+
+    df_filtered <- df %>%
+      filter(is.finite(.data[[logfc_col]]), is.finite(.data[[padj_col]]),
+             abs(.data[[logfc_col]]) >= absolute_log2fc_cutoff,
+             .data[[logfc_col]] != 0,
+             .data[[padj_col]] < adjusted_p_cutoff) %>%
+      mutate(Iteration = sh,
+             GeneSymbol = trimws(as.character(.data[[gene_col]])),
+             logFC_value = .data[[logfc_col]],
+             adj_p_value = .data[[padj_col]],
+             Direction = ifelse(logFC_value > 0, "Up", "Down")) %>%
+      dplyr::select(Iteration, GeneSymbol, logFC_value, adj_p_value, Direction, everything())
+    all_deg_list[[sh]] <- df_filtered
+  }
+
+  # =========================================================
+  # COMBINE ALL ITERATIONS
+  # =========================================================
+
+  all_deg <- bind_rows(all_deg_list)
+
+  # =========================================================
+  # CREATE DIRECTIONAL CONSENSUS LIST
+  # Direction must agree among all significant rows for an identifier.
+  # Nonsignificant rows do not participate in this directional check.
+  # Repeated IDs count once per iteration; means below summarize all rows.
+  # =========================================================
+
+  directional_consensus <- all_deg %>%
+    filter(!is.na(GeneSymbol), GeneSymbol != "") %>%
+    group_by(GeneSymbol) %>%
+    summarise(
+      Iterations_Present = n_distinct(Iteration),
+      Direction_List = paste(unique(Direction), collapse = ";"),
+      Consensus_Direction = first(Direction),
+      Mean_logFC = mean(logFC_value),
+      Median_logFC = median(logFC_value),
+      Min_adj_p_value = min(adj_p_value),
+      Mean_adj_p_value = mean(adj_p_value),
+      .groups = "drop"
+    ) %>%
+    filter(!str_detect(Direction_List, ";")) %>%
+    arrange(desc(Iterations_Present), Min_adj_p_value)
+
+  # =========================================================
+  # STRICT CONSENSUS: significant in the same direction in ALL iterations
+  # =========================================================
+
+  n_iterations <- length(sheets)
+  strict_consensus <- directional_consensus %>%
+    filter(Iterations_Present == n_iterations)
+
+  # =========================================================
+  # SAVE OUTPUTS
+  # =========================================================
+
+  write.xlsx(all_deg,
+             file.path(output_dir, paste0(comparison_name, "_Filtered_DEGs_AllIterations.xlsx")),
+             rowNames = FALSE, overwrite = TRUE)
+  write.xlsx(directional_consensus,
+             file.path(output_dir, paste0(comparison_name, "_Directional_Consensus_DEGs.xlsx")),
+             rowNames = FALSE, overwrite = TRUE)
+  write.xlsx(strict_consensus,
+             file.path(output_dir, paste0(comparison_name, "_Strict_Directional_Consensus_DEGs.xlsx")),
+             rowNames = FALSE, overwrite = TRUE)
+
+  cat("Filtered DEG rows:", nrow(all_deg), "\n")
+  cat("Directional consensus identifiers:", nrow(directional_consensus), "\n")
+  cat("Strict consensus identifiers:", nrow(strict_consensus), "\n")
+}
+
+# Consensus counts are descriptive; mean/minimum adjusted P values are not
+# combined significance tests. Overlapping iterations are not independent studies.
+capture.output(sessionInfo(), file = file.path(output_dir, "session_info.txt"))
+cat("All directional consensus DEG lists created.\n")
+
+# ===============================================================
+# RAW SUBSET + RMA NORMALIZATION
+# ===============================================================
+
+library(Biobase)
+library(affy)
+library(sva)
+library(ggplot2)
+
+# Input: one combined AffyBatch object from a single compatible array platform.
+raw_file <- "YOUR_COMBINED_RAW_OBJECT.rds"
+metadata_file <- "YOUR_SAMPLE_METADATA.xlsx"
+# Metadata columns: SampleID, Group, Batch. No inferred or imputed group labels.
+annotation_file <- "YOUR_PROBE_ANNOTATION.csv" # Columns: ProbeID,GeneSymbol
+groups_to_keep <- c("Group_A", "Group_B", "Group_C")
+reviewed_exclusions <- character(0) # Sample IDs excluded after independent QC review.
+z_cutoff <- 3
+set.seed(1234)
+preprocess_dir <- file.path(model_dir, "Preprocessing")
+matrix_dir <- file.path(model_dir, "Expression_matrices")
+ml_dir <- file.path(model_dir, "Exploratory_ML")
+for (folder in c(preprocess_dir, matrix_dir, ml_dir)) {
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+}
+
+meta <- as.data.frame(read_excel(metadata_file, col_types = "text"))
+stopifnot(all(c("SampleID", "Group", "Batch") %in% names(meta)))
+stopifnot(!anyNA(meta[, c("SampleID", "Group", "Batch")]), !anyDuplicated(meta$SampleID))
+stopifnot(all(vapply(meta[, c("SampleID", "Group", "Batch")],
+                     function(x) all(nzchar(trimws(x))), logical(1))))
+raw <- readRDS(raw_file)
+stopifnot(inherits(raw, "AffyBatch"), !anyDuplicated(sampleNames(raw)))
+meta <- meta %>% filter(Group %in% groups_to_keep)
+stopifnot(nrow(meta) >= 3, all(meta$SampleID %in% sampleNames(raw)))
+stopifnot(all(reviewed_exclusions %in% meta$SampleID))
+write.xlsx(data.frame(SampleID = reviewed_exclusions),
+           file.path(preprocess_dir, "Reviewed_exclusions.xlsx"), overwrite = TRUE)
+meta <- meta[!meta$SampleID %in% reviewed_exclusions, , drop = FALSE]
+raw_subset <- raw[, meta$SampleID]
+stopifnot(identical(sampleNames(raw_subset), meta$SampleID))
+meta$Group <- droplevels(factor(meta$Group))
+meta$Batch <- droplevels(factor(meta$Batch))
+rownames(meta) <- meta$SampleID
+stopifnot(nlevels(meta$Group) >= 2, all(table(meta$Group) >= 2))
+saveRDS(raw_subset, file.path(preprocess_dir, "Raw_subset.rds"))
+normalized <- affy::rma(raw_subset)
+expr_norm <- exprs(normalized)
+stopifnot(identical(colnames(expr_norm), meta$SampleID), all(is.finite(expr_norm)))
+saveRDS(expr_norm, file.path(preprocess_dir, "RMA_normalized_matrix.rds"))
+
+# ===============================================================
+# PCA + OUTLIER REVIEW BEFORE AND AFTER BATCH CORRECTION
+# ===============================================================
+
+make_pca <- function(expr_mat, info, stage) {
+  stopifnot(identical(colnames(expr_mat), info$SampleID), ncol(expr_mat) >= 3)
+  variable <- apply(expr_mat, 1, var) > 0
+  stopifnot(sum(variable) >= 2)
+  pca <- prcomp(t(expr_mat[variable, , drop = FALSE]), scale. = TRUE)
+  scores <- pca$x[, 1:2, drop = FALSE]
+  # Degenerate PC scores are assigned z = 0 rather than flagged as outliers.
+  zscore <- function(x) if (sd(x) == 0) rep(0, length(x)) else as.numeric(scale(x))
+  df <- data.frame(SampleID = rownames(scores), scores,
+                   Group = info$Group, Batch = info$Batch,
+                   Z_PC1 = zscore(scores[, 1]), Z_PC2 = zscore(scores[, 2]))
+  df$Flagged <- abs(df$Z_PC1) > z_cutoff | abs(df$Z_PC2) > z_cutoff
+  variance <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+  p <- ggplot(df, aes(PC1, PC2, color = Group, shape = Flagged)) +
+    geom_point(size = 3) + theme_bw() +
+    labs(title = stage, x = sprintf("PC1 (%.1f%%)", variance[1]),
+         y = sprintf("PC2 (%.1f%%)", variance[2]))
+  ggsave(file.path(preprocess_dir, paste0(stage, "_PCA.png")), p, width = 7, height = 5)
+  write.xlsx(df, file.path(preprocess_dir, paste0(stage, "_PCA.xlsx")), overwrite = TRUE)
+  df
+}
+pca_before <- make_pca(expr_norm, meta, "Before_batch_correction")
+write.xlsx(as.data.frame(table(meta$Batch, meta$Group)),
+           file.path(preprocess_dir, "Batch_by_group.xlsx"), overwrite = TRUE)
+
+# ComBat preserves the group effect. Confounded designs stop for review.
+# There is no fallback that discards the biological group model.
+expr_batch <- expr_norm
+if (nlevels(meta$Batch) > 1) {
+  design <- model.matrix(~ Batch + Group, meta)
+  if (qr(design)$rank < ncol(design)) stop("Batch and group are confounded; review the design")
+  if (nrow(design) <= ncol(design)) stop("No residual degrees of freedom")
+  if (any(table(meta$Batch) < 2)) stop("Each batch requires at least two samples for this workflow")
+  expr_batch <- sva::ComBat(dat = expr_norm, batch = meta$Batch,
+                            mod = model.matrix(~ Group, meta),
+                            par.prior = TRUE, prior.plots = FALSE)
+}
+pca_after <- make_pca(expr_batch, meta, "After_batch_correction")
+# Flags are exported only. Review them before editing reviewed_exclusions and rerunning.
+write.xlsx(pca_after[pca_after$Flagged, ],
+           file.path(preprocess_dir, "Samples_flagged_for_review.xlsx"), overwrite = TRUE)
+saveRDS(expr_batch, file.path(preprocess_dir, "Batch_corrected_probe_matrix.rds"))
+write.xlsx(meta, file.path(preprocess_dir, "Final_metadata.xlsx"), overwrite = TRUE)
+
+# ===============================================================
+# PROBE ANNOTATION + GENE MATRIX
+# ===============================================================
+
+annotation <- read.csv(annotation_file, stringsAsFactors = FALSE)
+stopifnot(all(c("ProbeID", "GeneSymbol") %in% names(annotation)))
+stopifnot(!anyNA(annotation$ProbeID), !anyDuplicated(annotation$ProbeID))
+# Resolve ambiguous probe-to-gene mappings explicitly before running.
+probe_info <- data.frame(ProbeID = rownames(expr_batch),
+                         Variance = apply(expr_batch, 1, var)) %>%
+  left_join(annotation[, c("ProbeID", "GeneSymbol")], by = "ProbeID") %>%
+  mutate(GeneSymbol = trimws(as.character(GeneSymbol))) %>%
+  filter(!is.na(GeneSymbol), GeneSymbol != "") %>%
+  arrange(GeneSymbol, desc(Variance), ProbeID) %>%
+  distinct(GeneSymbol, .keep_all = TRUE)
+if (!nrow(probe_info)) stop("No annotated probes match the expression matrix")
+# One highest-variance probe per gene, for exploratory expression matrices.
+expr_gene <- expr_batch[match(probe_info$ProbeID, rownames(expr_batch)), , drop = FALSE]
+rownames(expr_gene) <- probe_info$GeneSymbol
+write.xlsx(probe_info, file.path(matrix_dir, "Representative_probes.xlsx"), overwrite = TRUE)
+saveRDS(expr_gene, file.path(matrix_dir, "Gene_expression_matrix.rds"))
+
+# ===============================================================
+# CREATE STRICT-CONSENSUS EXPRESSION MATRICES
+# ===============================================================
+
+strict_files <- file.path(output_dir, paste0(
+  str_remove(str_remove(deg_files, "_DEGs_AllIterations\\.xlsx$"), "\\.xlsx$"),
+  "_Strict_Directional_Consensus_DEGs.xlsx"))
+feature_sets <- list()
+for (file in strict_files) {
+  comparison <- str_remove(basename(file), "_Strict_Directional_Consensus_DEGs\\.xlsx$")
+  deg <- as.data.frame(read_excel(file))
+  stopifnot("GeneSymbol" %in% names(deg))
+  genes <- unique(na.omit(as.character(deg$GeneSymbol)))
+  matched <- intersect(genes, rownames(expr_gene))
+  feature_sets[[comparison]] <- matched
+  folder <- file.path(matrix_dir, comparison)
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+  write.xlsx(data.frame(GeneSymbol = setdiff(genes, matched)),
+             file.path(folder, "Unmatched_genes.xlsx"), overwrite = TRUE)
+  expr_sub <- expr_gene[matched, , drop = FALSE]
+  write.xlsx(data.frame(GeneSymbol = rownames(expr_sub), expr_sub, check.names = FALSE),
+             file.path(folder, "Strict_consensus_expression.xlsx"), overwrite = TRUE)
+  write.xlsx(meta, file.path(folder, "Sample_metadata.xlsx"), overwrite = TRUE)
+  saveRDS(expr_sub, file.path(folder, "Strict_consensus_expression.rds"))
+}
+
+# ===============================================================
+# EXPLORATORY BINARY / MULTICLASS ML: RANDOM FOREST + ELASTIC NET
+# ===============================================================
+# IMPORTANT: global DEG selection, RMA, representative-probe selection, and
+# group-aware ComBat precede splits. Metrics below are exploratory and can be
+# optimistic. They are NOT independent validation or deployment estimates.
+# For validated prediction, perform all learned preprocessing and feature
+# selection within training resamples and use an independent evaluation cohort.
+
+library(randomForest)
+library(glmnet)
+library(pROC)
+library(tidyr)
+
+# One job per feature set and outcome definition; add rows as needed.
+# The feature_set value matches the comparison name in deg_files above.
+# Binary: two classes separated by ';', with the positive class LAST.
+# Multiclass: list all desired classes, separated by ';'.
+# To merge original classes, add a separate outcome column to metadata yourself.
+ml_jobs <- data.frame(
+  name = c("Binary_model", "Multiclass_model"),
+  feature_set = c("Comparison_A", "Comparison_A"),
+  outcome_column = c("Group", "Group"),
+  classes = c("Group_A;Group_B", "Group_A;Group_B;Group_C"),
+  stringsAsFactors = FALSE
+)
+n_repeats <- 50L
+train_fraction <- 0.8
+top_n <- 100L
+inner_folds <- 5L
+ntree <- 1000L
+elastic_alpha <- 0.5
+stability_fraction <- 0.5
+stopifnot(n_repeats >= 1, train_fraction > 0, train_fraction < 1,
+          inner_folds >= 3, top_n >= 1, stability_fraction > 0, stability_fraction <= 1,
+          !anyDuplicated(ml_jobs$name), all(grepl("^[A-Za-z][A-Za-z0-9_-]*$", ml_jobs$name)))
+
+get_roc <- function(y, prob, classes) {
+  if (length(classes) == 2) {
+    pROC::roc(y, prob[, classes[2]], levels = classes, direction = "<", quiet = TRUE)
+  } else {
+    # Micro-average one-versus-rest indicators using class-major ordering.
+    truth <- sapply(classes, function(cl) as.integer(y == cl))
+    pROC::roc(as.vector(truth), as.vector(prob[, classes, drop = FALSE]),
+              levels = c(0, 1), direction = "<", quiet = TRUE)
+  }
+}
+
+for (job_i in seq_len(nrow(ml_jobs))) {
+  job <- ml_jobs[job_i, ]
+  stopifnot(job$feature_set %in% names(feature_sets), job$outcome_column %in% names(meta))
+  classes <- strsplit(job$classes, ";", fixed = TRUE)[[1]]
+  stopifnot(length(classes) >= 2, !anyDuplicated(classes))
+  selected <- !is.na(meta[[job$outcome_column]]) & meta[[job$outcome_column]] %in% classes
+  info <- meta[selected, , drop = FALSE]
+  y <- factor(info[[job$outcome_column]], levels = classes)
+  genes <- feature_sets[[job$feature_set]]
+  if (length(genes) < 2) stop("Fewer than two matched consensus genes: ", job$feature_set)
+  x <- t(expr_gene[genes, info$SampleID, drop = FALSE])
+  stopifnot(all(is.finite(x)), all(table(y) >= 4))
+  folder <- file.path(ml_dir, job$name)
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+  writeLines(c("Exploratory repeated holdouts with global preprocessing and feature selection.",
+               "AUC and accuracy are not independent validation estimates.",
+               "Repeated holdouts overlap; summaries are descriptive, without confidence intervals."),
+             file.path(folder, "Interpretation.txt"))
+  perf <- list()
+  predictions <- list()
+  confusions <- list()
+  selections <- list()
+  splits <- list()
+
+  for (iteration in seq_len(n_repeats)) {
+    message("Exploratory model: ", job$name, " | repeat ", iteration)
+    set.seed(1234 + iteration)
+    # Stratified holdout: retain both training and test observations per class.
+    train <- unlist(lapply(classes, function(cl) {
+      idx <- which(y == cl)
+      n <- min(length(idx) - 1L, max(3L, floor(length(idx) * train_fraction)))
+      sample(idx, n)
+    }), use.names = FALSE)
+    test <- setdiff(seq_len(nrow(x)), train)
+    y_train <- y[train]
+    y_test <- y[test]
+    # Drop zero-variance features using training data only.
+    variable <- apply(x[train, , drop = FALSE], 2, var) > 0
+    if (sum(variable) < 2) stop("Too few variable training features in ", job$name)
+    x_train <- x[train, variable, drop = FALSE]
+    x_test <- x[test, variable, drop = FALSE]
+    counts <- table(y_train)
+    class_weights <- max(counts) / counts
+    sample_weights <- as.numeric(class_weights[as.character(y_train)])
+    splits[[iteration]] <- data.frame(Iteration = iteration, SampleID = rownames(x),
+                                      Partition = ifelse(seq_len(nrow(x)) %in% train, "Train", "Test"))
+
+    # RANDOM FOREST
+    rf <- randomForest::randomForest(x = x_train, y = y_train,
+                                     ntree = ntree, importance = TRUE, classwt = class_weights)
+    rf_prob <- predict(rf, x_test, type = "prob")[, classes, drop = FALSE]
+    importance <- randomForest::importance(rf, type = 2)[, 1]
+    rf_genes <- names(sort(importance, decreasing = TRUE))[seq_len(min(top_n, length(importance)))]
+
+    # ELASTIC NET: inner stratified CV; glmnet standardizes within each fit.
+    folds <- min(inner_folds, min(counts))
+    stopifnot(folds >= 3)
+    foldid <- integer(length(y_train))
+    for (cl in classes) {
+      idx <- which(y_train == cl)
+      foldid[idx] <- sample(rep(seq_len(folds), length.out = length(idx)))
+    }
+    family <- if (length(classes) == 2) "binomial" else "multinomial"
+    enet <- glmnet::cv.glmnet(x_train, y_train, family = family,
+                              alpha = elastic_alpha, foldid = foldid,
+                              weights = sample_weights, standardize = TRUE,
+                              type.measure = "deviance")
+    prediction <- predict(enet, newx = x_test, s = "lambda.min", type = "response")
+    if (length(classes) == 2) {
+      enet_prob <- cbind(1 - as.numeric(prediction), as.numeric(prediction))
+      colnames(enet_prob) <- classes
+    } else {
+      enet_prob <- matrix(prediction[, , 1], nrow = nrow(x_test), ncol = length(classes),
+                           dimnames = list(rownames(x_test), dimnames(prediction)[[2]]))
+      enet_prob <- enet_prob[, classes, drop = FALSE]
+    }
+    coefficients <- coef(enet, s = "lambda.min")
+    if (!is.list(coefficients)) coefficients <- list(coefficients)
+    enet_genes <- unique(unlist(lapply(coefficients, function(mat) {
+      rownames(mat)[as.numeric(mat[, 1]) != 0 & rownames(mat) != "(Intercept)"]
+    }), use.names = FALSE))
+    # RF counts top-N importances; ENet counts nonzero coefficients (different definitions).
+    selections[[iteration]] <- bind_rows(
+      data.frame(Iteration = rep(iteration, length(rf_genes)), Model = rep("RF", length(rf_genes)), Gene = rf_genes),
+      data.frame(Iteration = rep(iteration, length(enet_genes)), Model = rep("ENet", length(enet_genes)), Gene = enet_genes))
+
+    for (model in c("RF", "ENet")) {
+      prob <- if (model == "RF") rf_prob else enet_prob
+      predicted <- factor(classes[max.col(prob, ties.method = "first")], levels = classes)
+      roc <- get_roc(y_test, prob, classes)
+      perf[[length(perf) + 1]] <- data.frame(Iteration = iteration, Model = model,
+                                            AUC = as.numeric(pROC::auc(roc)),
+                                            Accuracy = mean(predicted == y_test))
+      pred <- data.frame(Iteration = iteration, Model = model, SampleID = rownames(x_test),
+                         Reference = as.character(y_test), Prediction = as.character(predicted))
+      predictions[[length(predictions) + 1]] <- cbind(pred, as.data.frame(prob, check.names = FALSE))
+      cm <- as.data.frame(table(Prediction = predicted, Reference = y_test))
+      cm$Iteration <- iteration
+      cm$Model <- model
+      confusions[[length(confusions) + 1]] <- cm
+      # Fixed first-repeat ROC, rather than selecting the best test-set repeat.
+      if (iteration == 1) {
+        png(file.path(folder, paste0(model, "_ROC_first_repeat.png")), width = 1500, height = 1200, res = 200)
+        plot(roc, main = paste("Exploratory", model, if (length(classes) > 2) "micro-averaged ROC" else "ROC"))
+        dev.off()
+      }
+    }
+    saveRDS(list(RF = rf, ENet = enet, features = colnames(x_train), classes = classes,
+                 train = rownames(x_train), test = rownames(x_test)),
+            file.path(folder, paste0("Models_repeat_", iteration, ".rds")))
+  }
+
+  # PERFORMANCE, PREDICTIONS, CONFUSION MATRICES, AND SELECTION STABILITY
+  performance <- bind_rows(perf)
+  summary <- performance %>% group_by(Model) %>%
+    summarise(Mean_AUC = mean(AUC), SD_AUC = sd(AUC), Mean_accuracy = mean(Accuracy),
+               SD_accuracy = sd(Accuracy), .groups = "drop")
+  write.xlsx(list(Per_repeat = performance, Descriptive_summary = summary),
+             file.path(folder, "Exploratory_performance.xlsx"), overwrite = TRUE)
+  write.xlsx(bind_rows(predictions), file.path(folder, "Predictions.xlsx"), overwrite = TRUE)
+  write.xlsx(bind_rows(splits), file.path(folder, "Sample_splits.xlsx"), overwrite = TRUE)
+  confusion <- bind_rows(confusions)
+  confusion_summary <- confusion %>% group_by(Model, Prediction, Reference) %>%
+    summarise(Total = sum(Freq), Mean = mean(Freq), .groups = "drop")
+  write.xlsx(list(Per_repeat = confusion, Summary = confusion_summary),
+             file.path(folder, "Confusion_matrices.xlsx"), overwrite = TRUE)
+  selection_table <- bind_rows(selections)
+  frequency <- selection_table %>% distinct(Iteration, Model, Gene) %>%
+    count(Gene, Model, name = "Frequency") %>%
+    pivot_wider(names_from = Model, values_from = Frequency, values_fill = 0)
+  for (model in c("RF", "ENet")) if (!model %in% names(frequency)) frequency[[model]] <- 0L
+  frequency <- frequency %>% mutate(Total = RF + ENet,
+                                     Stability_score = Total / (2 * n_repeats)) %>% arrange(desc(Total))
+  threshold <- ceiling(n_repeats * stability_fraction)
+  write.xlsx(list(Selections = selection_table, Frequency = frequency,
+                  Stable = frequency %>% filter(RF >= threshold | ENet >= threshold),
+                  Common_models = frequency %>% filter(RF > 0, ENet > 0)),
+             file.path(folder, "Feature_stability.xlsx"), overwrite = TRUE)
+  if (nrow(frequency)) {
+    top <- head(frequency, 20)
+    p <- ggplot(top, aes(reorder(Gene, Total), Total)) + geom_col() + coord_flip() +
+      theme_bw() + labs(title = "Exploratory feature selection frequency", x = NULL, y = "Total selections")
+    ggsave(file.path(folder, "Feature_stability.png"), p, width = 7, height = 6)
+    if (requireNamespace("pheatmap", quietly = TRUE)) {
+      mat <- as.matrix(head(frequency[, c("RF", "ENet")], 50))
+      rownames(mat) <- head(frequency$Gene, 50)
+      pheatmap::pheatmap(mat, cluster_rows = nrow(mat) > 1, cluster_cols = FALSE,
+                        filename = file.path(folder, "Stability_heatmap.png"))
+    }
+  }
+}
+
+write.xlsx(ml_jobs, file.path(ml_dir, "Model_jobs.xlsx"), overwrite = TRUE)
+capture.output(sessionInfo(), file = file.path(model_dir, "Combined_pipeline_session_info.txt"))
+cat("Combined consensus, preprocessing, and exploratory ML pipeline completed.\n")
